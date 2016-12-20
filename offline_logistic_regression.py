@@ -8,6 +8,7 @@ import traceback
 import logging, logging.config
 import ftrl_model
 import time
+from logging.config import dictConfig
 
 logging.config.fileConfig('./logger.conf')
 
@@ -16,7 +17,9 @@ logger = logging.getLogger()
 flags = tf.app.flags
 FLAGS = flags.FLAGS
 
-flags.DEFINE_float('learning_rate', 0.001, 'Initial learning rate.')
+sync_queue_name_template = 'sync_queue_{}'
+
+flags.DEFINE_float('learning_rate', 0.5, 'Initial learning rate.')
 flags.DEFINE_integer('num_epochs', 120, 'Number of epochs to run trainer.')
 flags.DEFINE_integer('batch_size', 500, 'Batch size. Must divide evenly into the dataset sizes.')
 flags.DEFINE_integer('features', 4762348, 'Feature size')
@@ -59,6 +62,16 @@ def parse_line_for_batch_for_libsvm(line):
         values.append(value)
     return label, indices, values
 
+def get_sync_queue(num_ps):
+    enqueue_ops = []
+    for i in range(num_ps):
+        sync_queue_name = sync_queue_name_template.format(i)
+        with tf.device('/job:ps/task:{}'.format(i)):
+            queue = tf.FIFOQueue(1, tf.int32, shared_name=sync_queue_name)
+        logger.info('Create sync queue name: {}'.format(sync_queue_name))
+        enqueue_ops.append(queue.enqueue(1))
+    return enqueue_ops
+
 learning_rate = FLAGS.learning_rate
 num_epochs = FLAGS.num_epochs
 batch_size = FLAGS.batch_size
@@ -71,11 +84,19 @@ cluster_conf = json.load(open("cluster_conf.json", "r"))
 cluster_spec = tf.train.ClusterSpec(cluster_conf)
 
 num_workers = len(cluster_conf['worker'])
+num_ps = len(cluster_conf['ps'])
 
 server = tf.train.Server(cluster_spec, job_name=FLAGS.job_name, task_index = FLAGS.task_index)
 
 if FLAGS.job_name == "ps":
-    server.join()
+   #server.join()
+    sync_queue_name = sync_queue_name_template.format(FLAGS.task_index)
+    queue = tf.FIFOQueue(1, tf.int32, shared_name=sync_queue_name)
+    dequeue_op = queue.dequeue()
+    sess = tf.Session(server.target)
+    logger.info('Parameter servier will monitor queue: {}'.format(sync_queue_name))
+    sess.run(dequeue_op)
+    logger.info("Terminating parameter server: {}".format(FLAGS.task_index))
 
 elif FLAGS.job_name == "worker" :
     is_chief = (FLAGS.task_index == 0)
@@ -86,6 +107,7 @@ elif FLAGS.job_name == "worker" :
                     ps_device="/job:ps/cpu:0",
                     cluster = cluster_spec)) :
             global_step = tf.get_variable('global_step', [], initializer = tf.constant_initializer(0), trainable = False)
+            enqueue_ops = get_sync_queue(num_ps)
             logger.info("Reading training data:{}".format(trainset_file))
             train_filename_queue = tf.train.string_input_producer(trainset_file, name='input_producer_{}'.format(FLAGS.task_index), num_epochs=num_epochs)
            #train_filename_queue = tf.train.string_input_producer(trainset_file, name='input_producer_{}'.format(FLAGS.task_index))
@@ -100,17 +122,17 @@ elif FLAGS.job_name == "worker" :
             sync_init_op = opt.get_init_tokens_op()
             chief_queue_runner = opt.get_chief_queue_runner()
             init_op = tf.global_variables_initializer()
-           #init_op = [tf.global_variables_initializer(), tf.initialize_local_variables()]
-            saver = tf.train.Saver()
-           #saver = tf.train.Saver({'weight': model.weight})
 
             local_init_op = opt.local_step_init_op
+
             if is_chief:
 		local_init_op = opt.chief_init_op
 
             local_init_op = [local_init_op, tf.initialize_local_variables()]
 
             ready_for_local_init_op = opt.ready_for_local_init_op
+
+            saver = tf.train.Saver([model.weight])
 
             sv = tf.train.Supervisor(
                     is_chief=is_chief,
@@ -131,7 +153,6 @@ elif FLAGS.job_name == "worker" :
             logger.info('Start waiting/prepare for session.')
             sess = sv.prepare_or_wait_for_session(server.target, config=config)
             logger.info('Session is ready.')
-           #sess.run(tf.initialize_local_variables())
 
             if is_chief:
                 sess.run(sync_init_op)
@@ -146,7 +167,7 @@ elif FLAGS.job_name == "worker" :
                 label, indices, sparse_indices, weight_list, read_count = read_batch(sess, train_data_line, batch_size)
                 if read_count == 0:
                     break
-                if step % 1000 == 0:
+                if step % 500 == 0:
                     global_step_val = sess.run(global_step)
                     logger.info('Current step is {}, global step is {}, current processed sample is {}'.format(step, global_step_val, total_read_count))
                 total_read_count += read_count
@@ -155,5 +176,6 @@ elif FLAGS.job_name == "worker" :
                 if read_count < batch_size:
                     logger.info('All data trained finished. Last batch size is: {}, total trained sample is {}'.format(batch_size, total_read_count))
                     break
-           #sv.wait_for_stop()
+            for op in enqueue_ops:
+                sess.run(op)
             sv.stop()
